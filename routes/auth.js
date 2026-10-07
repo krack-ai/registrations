@@ -52,10 +52,16 @@ router.post("/register", async (req, res) => {
 
 });
 router.post("/login", async (req, res) => {
-
     try {
 
         const { email, password } = req.body;
+
+        console.log("Login attempt:", email);
+
+        console.log(
+            "JWT_SECRET exists:",
+            !!process.env.JWT_SECRET
+        );
 
         const usersRef = db.ref("users");
 
@@ -64,67 +70,81 @@ router.post("/login", async (req, res) => {
             .equalTo(email)
             .once("value");
 
-        if (!snapshot.exists()) {
+        console.log(
+            "User found:",
+            snapshot.exists()
+        );
 
+        if (!snapshot.exists()) {
             return res.status(404).json({
                 message: "User not found"
             });
-
         }
 
         let userId;
         let user;
 
         snapshot.forEach(item => {
-
             userId = item.key;
             user = item.val();
-
         });
+
+        console.log("User ID:", userId);
+        console.log("Password exists:", !!user.password);
 
         const validPassword = await bcrypt.compare(
             password,
             user.password
         );
 
-        if (!validPassword) {
+        console.log(
+            "Password valid:",
+            validPassword
+        );
 
+        if (!validPassword) {
             return res.status(400).json({
                 message: "Invalid Password"
             });
-
         }
 
-       const token = jwt.sign(
-    {
-        userId,
-        email: user.email
-    },
-    process.env.JWT_SECRET,
-    {
-        expiresIn: "1d"
-    }
-);
+        if (!process.env.JWT_SECRET) {
+            throw new Error("JWT_SECRET is not configured");
+        }
+
+        const token = jwt.sign(
+            {
+                userId,
+                email: user.email
+            },
+            process.env.JWT_SECRET,
+            {
+                expiresIn: "1d"
+            }
+        );
+
+        console.log("JWT generated successfully");
 
         res.json({
-    token,
-    user: {
-        userId,
-        firstName: user.firstName,
-        lastName: user.lastName,
-        email: user.email,
-        phone: user.phone
-    }
-});
+            token,
+            user: {
+                userId,
+                firstName: user.firstName,
+                lastName: user.lastName,
+                email: user.email,
+                phone: user.phone
+            }
+        });
 
     } catch (err) {
+
+        console.error("LOGIN ERROR:", err);
 
         res.status(500).json({
             error: err.message
         });
 
     }
-
 });
 
 export default router
