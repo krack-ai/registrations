@@ -677,4 +677,76 @@ router.get("/track/visit/:trackingId", async (req, res) => {
   }
 });
 
+// GET /api/profile/admin/users
+// Returns unique submitter emails for the dropdown.
+router.get("/admin/users", auth, async (req, res) => {
+  try {
+    const snapshot = await db.ref("profiles").once("value");
+    const users = new Set();
+
+    snapshot.forEach((item) => {
+      const submittedUser = item.val()?.submittedUser?.trim();
+
+      if (submittedUser) {
+        users.add(submittedUser.toLowerCase());
+      }
+    });
+
+    return res.json({
+      success: true,
+      users: [...users].sort(),
+    });
+  } catch (error) {
+    console.error("Fetch submitters error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Unable to fetch submitters",
+    });
+  }
+});
+
+// GET /api/profile/admin/all
+// Returns all submitted profiles and their tracking status.
+router.get("/admin/all", auth, async (req, res) => {
+  try {
+    const snapshot = await db.ref("profiles").once("value");
+    const profiles = [];
+
+    snapshot.forEach((item) => {
+      const profile = item.val() || {};
+      const tracking = profile.emailTracking || {};
+
+      profiles.push({
+        id: item.key,
+        fullName: profile.fullName || "",
+        email: profile.email || "",
+        phone: profile.phone || "",
+        techStack: profile.techStack || "",
+        submittedUser: profile.submittedUser || "",
+        createdAt: profile.createdAt || null,
+        clicked: tracking.clicked === true,
+        clickedAt: tracking.clickedAt || null,
+        visited: tracking.visited === true,
+        visitedAt: tracking.visitedAt || null,
+      });
+    });
+
+    profiles.sort(
+      (a, b) => (b.createdAt || 0) - (a.createdAt || 0)
+    );
+
+    return res.json({
+      success: true,
+      total: profiles.length,
+      profiles,
+    });
+  } catch (error) {
+    console.error("Fetch all profiles error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Unable to fetch profiles",
+    });
+  }
+});
+
 export default router;
