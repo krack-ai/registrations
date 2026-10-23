@@ -1,3 +1,4 @@
+
 import express from "express";
 import { db } from "../config/firebase.js";
 import auth from "../middleware/auth.js";
@@ -10,24 +11,48 @@ dotenv.config();
 const router = express.Router();
 const resend = new Resend(process.env.RESEND_API_KEY);
 
-// Your backend public URL
-// Example:
-// https://api.krack-ai.com
-const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:5000";
+const BACKEND_URL = (
+  process.env.BACKEND_URL || "http://localhost:5000"
+).replace(/\/$/, "");
 
-// Your website URL
 const WEBSITE_URL =
   process.env.WEBSITE_URL || "https://www.krack-ai.com";
+
+function normalizeEmail(email) {
+  return String(email || "").trim().toLowerCase();
+}
+
+function getEmailKey(email) {
+  return crypto
+    .createHash("sha256")
+    .update(normalizeEmail(email))
+    .digest("hex");
+}
+
+function getDateKey(timestamp = Date.now()) {
+  return new Date(timestamp).toISOString().slice(0, 10);
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
 
 /*
 |--------------------------------------------------------------------------
 | STATS
 |--------------------------------------------------------------------------
+| Reads aggregate counts from:
+| profileStats/{submitterHash}/{YYYY-MM-DD}
 */
 
 router.post("/stats", auth, async (req, res) => {
   try {
-    const { email } = req.body;
+    const email = normalizeEmail(req.body?.email);
 
     if (!email) {
       return res.status(400).json({
@@ -36,44 +61,22 @@ router.post("/stats", auth, async (req, res) => {
       });
     }
 
+    const submitterKey = getEmailKey(email);
+
     const snapshot = await db
-      .ref("profiles")
-      .orderByChild("submittedUser")
-      .equalTo(email)
+      .ref(`profileStats/${submitterKey}`)
       .once("value");
 
-    const profiles = [];
+    const counts = snapshot.val() || {};
+    let totalCount = 0;
 
-    snapshot.forEach((item) => {
-      profiles.push({
-        id: item.key,
-        ...item.val(),
-      });
-    });
-
-    const totalCount = profiles.length;
-
-    const dailyCounts = {};
-
-    profiles.forEach((profile) => {
-      if (!profile.createdAt) return;
-
-      const date = new Date(profile.createdAt)
-        .toISOString()
-        .split("T")[0];
-
-      if (!dailyCounts[date]) {
-        dailyCounts[date] = 0;
-      }
-
-      dailyCounts[date]++;
-    });
-
-    const dailyStats = Object.entries(dailyCounts)
-      .map(([date, count]) => ({
-        date,
-        count,
-      }))
+    const dailyStats = Object.entries(counts)
+      .map(([date, value]) => {
+        const count = Number(value) || 0;
+        totalCount += count;
+        return { date, count };
+      })
+      .filter((item) => item.count > 0)
       .sort((a, b) => b.date.localeCompare(a.date));
 
     return res.json({
@@ -82,12 +85,12 @@ router.post("/stats", auth, async (req, res) => {
       totalCount,
       dailyStats,
     });
-  } catch (err) {
-    console.error("Stats error:", err);
+  } catch (error) {
+    console.error("Stats error:", error);
 
     return res.status(500).json({
       success: false,
-      error: err.message,
+      message: "Unable to fetch stats",
     });
   }
 });
@@ -99,14 +102,22 @@ router.post("/stats", auth, async (req, res) => {
 */
 
 router.post("/submit", auth, async (req, res) => {
+  let emailKey;
+  let reservationId;
+  let reservationClaimed = false;
+  let profileSaved = false;
+
   try {
     const {
-      fullName,
-      email,
-      phone,
-      techStack,
-      submittedUser,
-    } = req.body;
+      fullName = "",
+      email: rawEmail,
+      phone = "",
+      techStack = "",
+      submittedUser: rawSubmittedUser,
+    } = req.body || {};
+
+    const email = normalizeEmail(rawEmail);
+    const submittedUser = normalizeEmail(rawSubmittedUser);
 
     if (!email) {
       return res.status(400).json({
@@ -115,436 +126,214 @@ router.post("/submit", auth, async (req, res) => {
       });
     }
 
-    // Check if email already exists
-    const snapshot = await db
-      .ref("profiles")
-      .orderByChild("email")
-      .equalTo(email)
-      .once("value");
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({
+        success: false,
+        message: "Please provide a valid email",
+      });
+    }
 
-    if (snapshot.exists()) {
+    if (!submittedUser) {
+      return res.status(400).json({
+        success: false,
+        message: "Submitter email is required",
+      });
+    }
+
+    if (!process.env.RESEND_API_KEY) {
+      return res.status(500).json({
+        success: false,
+        message: "Email service is not configured",
+      });
+    }
+
+    emailKey = getEmailKey(email);
+    reservationId = crypto.randomUUID();
+
+    const lookupRef = db.ref(`emailLookup/${emailKey}`);
+
+    // Atomically reserve the email to prevent simultaneous duplicates.
+    const reservation = await lookupRef.transaction((current) => {
+      if (current !== null) {
+        return; // Abort: email already exists or is reserved.
+      }
+
+      return {
+        status: "pending",
+        reservationId,
+        email,
+        createdAt: Date.now(),
+      };
+    });
+
+    if (!reservation.committed) {
       return res.status(409).json({
         success: false,
         message: "Email already exists",
       });
     }
 
-    /*
-    |--------------------------------------------------------------------------
-    | Generate unique tracking ID
-    |--------------------------------------------------------------------------
-    */
+    reservationClaimed = true;
 
+    const profileRef = db.ref("profiles").push();
     const trackingId = crypto.randomUUID();
+    const createdAt = Date.now();
 
-    /*
-    |--------------------------------------------------------------------------
-    | Tracking URL
-    |--------------------------------------------------------------------------
-    */
+    const profile = {
+      userId: req.user?.userId || null,
+      fullName: String(fullName).trim(),
+      email,
+      phone: String(phone).trim(),
+      techStack: String(techStack).trim(),
+      createdAt,
+      submittedUser,
+      trackingId,
+      emailTracking: {
+        clicked: false,
+        clickedAt: null,
+        visited: false,
+        visitedAt: null,
+      },
+    };
+
+    // Save the profile and lookup entry together.
+    await db.ref().update({
+      [`profiles/${profileRef.key}`]: profile,
+      [`emailLookup/${emailKey}`]: {
+        profileId: profileRef.key,
+        email,
+      },
+    });
+
+    profileSaved = true;
+    reservationClaimed = false;
+
+    // Update daily stats.
+    const submitterKey = getEmailKey(submittedUser);
+    const dateKey = getDateKey(createdAt);
+
+    try {
+      await db
+        .ref(`profileStats/${submitterKey}/${dateKey}`)
+        .transaction((current) => (Number(current) || 0) + 1);
+
+      // Maintain the unique submitter list for /admin/users.
+      await db.ref(`submitters/${submitterKey}`).transaction(
+        (current) => current || { email: submittedUser }
+      );
+    } catch (aggregateError) {
+      console.error(
+        "Profile saved, but stats/submitter update failed:",
+        aggregateError
+      );
+    }
 
     const trackingUrl =
       `${BACKEND_URL}/api/profile/track/click/${trackingId}`;
 
-    /*
-    |--------------------------------------------------------------------------
-    | Send email
-    |--------------------------------------------------------------------------
-    */
-~
-    await resend.emails.send({
-      from: "Krack-AI <promotions@mail.krack-ai.com>",
-      to: email,
-      subject: "🎉 Congratulations on Your Selection!",
+    const html = `
+      <!DOCTYPE html>
+      <html>
+      <body style="margin:0;padding:30px;background:#f4f7fb;font-family:Arial,sans-serif;color:#1f2937">
+        <div style="max-width:600px;margin:auto;background:white;padding:30px;border-radius:14px">
+          <h1 style="color:#4f46e5">🎉 Congratulations!</h1>
+          <p>Hi <strong>${escapeHtml(fullName || "there")}</strong>,</p>
+          <p>We're excited to congratulate you on your selection!</p>
+          <p>We wish you tremendous success as you begin this exciting journey.</p>
+          <div style="padding:20px;background:#f8fafc;border-radius:10px">
+            <p style="color:#6366f1;font-weight:bold">YOUR TECH STACK</p>
+            <h2>${escapeHtml(techStack || "Technology")}</h2>
+          </div>
+          <p>Meet <strong>Krack-AI</strong>, your AI-powered interview practice assistant.</p>
+          <p style="text-align:center;margin:30px">
+            <a href="${escapeHtml(trackingUrl)}"
+               style="display:inline-block;padding:15px 28px;background:#4f46e5;color:white;text-decoration:none;border-radius:8px;font-weight:bold">
+              Explore Krack-AI →
+            </a>
+          </p>
+          <p>Best wishes,<br><strong>Team Krack-AI</strong></p>
+        </div>
+      </body>
+      </html>
+    `;
 
-html: `
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Congratulations on Your Selection</title>
-</head>
+    // Profile is already saved. Email failure won't create duplicate profiles.
+    let emailSent = false;
 
-<body
-  style="
-    margin: 0;
-    padding: 0;
-    background-color: #f4f7fb;
-    font-family: Arial, Helvetica, sans-serif;
-    color: #1f2937;
-  "
->
+    try {
+      const result = await resend.emails.send({
+        from: "Krack-AI <promotions@mail.krack-ai.com>",
+        to: email,
+        subject: "🎉 Congratulations on Your Selection!",
+        html,
+      });
 
-  <table
-    width="100%"
-    cellpadding="0"
-    cellspacing="0"
-    border="0"
-    style="background-color: #f4f7fb; padding: 40px 15px;"
-  >
-    <tr>
-      <td align="center">
-
-        <!-- Main Container -->
-        <table
-          width="100%"
-          cellpadding="0"
-          cellspacing="0"
-          border="0"
-          style="
-            max-width: 620px;
-            background-color: #ffffff;
-            border-radius: 18px;
-            overflow: hidden;
-            box-shadow: 0 8px 30px rgba(0,0,0,0.08);
-          "
-        >
-
-          <!-- Header -->
-          <tr>
-            <td
-              align="center"
-              style="
-                padding: 42px 30px;
-                background: linear-gradient(135deg, #111827, #312e81);
-              "
-            >
-
-              <div
-                style="
-                  display: inline-block;
-                  width: 64px;
-                  height: 64px;
-                  line-height: 64px;
-                  background-color: rgba(255,255,255,0.15);
-                  border-radius: 50%;
-                  font-size: 32px;
-                  margin-bottom: 18px;
-                "
-              >
-                🎉
-              </div>
-
-              <h1
-                style="
-                  margin: 0;
-                  color: #ffffff;
-                  font-size: 30px;
-                  line-height: 1.2;
-                  font-weight: 700;
-                "
-              >
-                Congratulations!
-              </h1>
-
-              <p
-                style="
-                  margin: 12px 0 0;
-                  color: #dbeafe;
-                  font-size: 16px;
-                  line-height: 1.5;
-                "
-              >
-                Your next chapter starts here.
-              </p>
-
-            </td>
-          </tr>
-
-
-          <!-- Content -->
-          <tr>
-            <td style="padding: 40px 40px 20px;">
-
-              <p
-                style="
-                  margin: 0 0 20px;
-                  font-size: 18px;
-                  color: #111827;
-                "
-              >
-                Hi <strong>${fullName || "there"}</strong>,
-              </p>
-
-              <p
-                style="
-                  margin: 0 0 20px;
-                  font-size: 16px;
-                  line-height: 1.7;
-                  color: #4b5563;
-                "
-              >
-                We're excited to congratulate you on your
-                <strong style="color: #111827;">
-                  selection!
-                </strong>
-                🎊
-              </p>
-
-              <p
-                style="
-                  margin: 0 0 28px;
-                  font-size: 16px;
-                  line-height: 1.7;
-                  color: #4b5563;
-                "
-              >
-                This is a fantastic achievement, and we wish you
-                tremendous success as you begin this exciting new
-                journey. Keep learning, keep growing, and keep
-                building great things.
-              </p>
-
-
-              <!-- Highlight Card -->
-              <table
-                width="100%"
-                cellpadding="0"
-                cellspacing="0"
-                border="0"
-                style="
-                  background-color: #f8fafc;
-                  border: 1px solid #e5e7eb;
-                  border-radius: 14px;
-                  margin-bottom: 28px;
-                "
-              >
-                <tr>
-                  <td style="padding: 24px;">
-
-                    <p
-                      style="
-                        margin: 0 0 8px;
-                        font-size: 13px;
-                        text-transform: uppercase;
-                        letter-spacing: 1px;
-                        color: #6366f1;
-                        font-weight: 700;
-                      "
-                    >
-                      Your Tech Stack
-                    </p>
-
-                    <p
-                      style="
-                        margin: 0;
-                        font-size: 22px;
-                        font-weight: 700;
-                        color: #111827;
-                      "
-                    >
-                      ${techStack || "Technology"}
-                    </p>
-
-                  </td>
-                </tr>
-              </table>
-
-
-              <p
-                style="
-                  margin: 0 0 18px;
-                  font-size: 16px;
-                  line-height: 1.7;
-                  color: #4b5563;
-                "
-              >
-                Preparing for your next interview or looking to
-                sharpen your interview skills?
-              </p>
-
-              <p
-                style="
-                  margin: 0 0 28px;
-                  font-size: 16px;
-                  line-height: 1.7;
-                  color: #4b5563;
-                "
-              >
-                Meet <strong style="color: #111827;">Krack-AI</strong> —
-                an AI-powered interview assistant designed to help
-                you practice, improve your answers, and walk into
-                your next interview with greater confidence.
-              </p>
-
-
-              <!-- CTA -->
-              <table
-                width="100%"
-                cellpadding="0"
-                cellspacing="0"
-                border="0"
-                style="margin-bottom: 30px;"
-              >
-                <tr>
-                  <td align="center">
-
-                    <a
-                      href="${trackingUrl}"
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      style="
-                        display: inline-block;
-                        padding: 15px 34px;
-                        background-color: #4f46e5;
-                        color: #ffffff;
-                        text-decoration: none;
-                        border-radius: 10px;
-                        font-size: 16px;
-                        font-weight: 700;
-                        letter-spacing: 0.2px;
-                      "
-                    >
-                      Explore Krack-AI →
-                    </a>
-
-                  </td>
-                </tr>
-              </table>
-
-
-              <p
-                style="
-                  margin: 0 0 10px;
-                  text-align: center;
-                  font-size: 13px;
-                  color: #9ca3af;
-                "
-              >
-                Your next interview could be your best one yet.
-              </p>
-
-            </td>
-          </tr>
-
-
-          <!-- Footer -->
-          <tr>
-            <td
-              align="center"
-              style="
-                padding: 25px 30px;
-                background-color: #f8fafc;
-                border-top: 1px solid #eef2f7;
-              "
-            >
-
-              <p
-                style="
-                  margin: 0 0 6px;
-                  font-size: 14px;
-                  color: #6b7280;
-                "
-              >
-                Best wishes,
-              </p>
-
-              <p
-                style="
-                  margin: 0;
-                  font-size: 15px;
-                  font-weight: 700;
-                  color: #111827;
-                "
-              >
-                Team Krack-AI
-              </p>
-
-              <p
-                style="
-                  margin: 12px 0 0;
-                  font-size: 12px;
-                  color: #9ca3af;
-                "
-              >
-                AI-powered interview preparation
-              </p>
-
-            </td>
-          </tr>
-
-        </table>
-
-      </td>
-    </tr>
-  </table>
-
-</body>
-</html>
-`,
-    });
-
-    /*
-    |--------------------------------------------------------------------------
-    | Save profile + tracking information
-    |--------------------------------------------------------------------------
-    */
-
-    await db.ref("profiles").push({
-      userId: req.user.userId,
-
-      fullName,
-      email,
-      phone,
-      techStack,
-
-      createdAt: Date.now(),
-
-      submittedUser,
-
-      trackingId,
-
-      emailTracking: {
-        clicked: false,
-        clickedAt: null,
-
-        visited: false,
-        visitedAt: null,
-      },
-    });
+      if (result?.error) {
+        console.error("Resend error:", result.error);
+      } else {
+        emailSent = true;
+      }
+    } catch (emailError) {
+      console.error("Email send error:", emailError);
+    }
 
     return res.status(201).json({
       success: true,
-      message: "Profile Submitted Successfully",
+      message: emailSent
+        ? "Profile submitted successfully"
+        : "Profile saved, but email could not be sent",
+      emailSent,
     });
+  } catch (error) {
+    console.error("Submit error:", error);
 
-  } catch (err) {
-    console.error("Submit error:", err);
+    // Release only our own reservation if no profile was saved.
+    if (reservationClaimed && !profileSaved && emailKey && reservationId) {
+      try {
+        await db.ref(`emailLookup/${emailKey}`).transaction((current) => {
+          if (
+            current?.status === "pending" &&
+            current?.reservationId === reservationId
+          ) {
+            return null;
+          }
+
+          return current;
+        });
+      } catch (cleanupError) {
+        console.error("Reservation cleanup error:", cleanupError);
+      }
+    }
 
     return res.status(500).json({
       success: false,
-      error: err.message,
+      message: "Unable to submit profile",
     });
   }
 });
+
 
 /*
 |--------------------------------------------------------------------------
 | EMAIL CLICK TRACKING
 |--------------------------------------------------------------------------
-|
-| Email:
-|
-| /track/click/:trackingId
-|
-| User clicks email link
-|       ↓
-| Backend records click
-|       ↓
-| Redirects to website
-|
-|--------------------------------------------------------------------------
+| GET /api/profile/track/click/:trackingId
+| Records the click and redirects to the website.
 */
 
 router.get("/track/click/:trackingId", async (req, res) => {
   try {
     const { trackingId } = req.params;
 
+    if (!trackingId) {
+      return res.status(400).send("Tracking ID is required");
+    }
+
     const snapshot = await db
       .ref("profiles")
       .orderByChild("trackingId")
       .equalTo(trackingId)
+      .limitToFirst(1)
       .once("value");
 
     if (!snapshot.exists()) {
@@ -552,51 +341,30 @@ router.get("/track/click/:trackingId", async (req, res) => {
     }
 
     let profileKey = null;
-    let profile = null;
 
     snapshot.forEach((item) => {
       profileKey = item.key;
-      profile = item.val();
     });
 
-    if (!profileKey || !profile) {
+    if (!profileKey) {
       return res.status(404).send("Invalid tracking link");
     }
-
-    /*
-    |--------------------------------------------------------------------------
-    | Record click
-    |--------------------------------------------------------------------------
-    */
-
-    const clickedAt = Date.now();
 
     await db
       .ref(`profiles/${profileKey}/emailTracking`)
       .update({
         clicked: true,
-        clickedAt,
+        clickedAt: Date.now(),
       });
 
-    /*
-    |--------------------------------------------------------------------------
-    | Redirect user to website
-    |--------------------------------------------------------------------------
-    */
-
-    const visitUrl =
+    const redirectUrl =
       `${WEBSITE_URL}?trackingId=${encodeURIComponent(trackingId)}`;
 
-    return res.redirect(302, visitUrl);
+    return res.redirect(302, redirectUrl);
+  } catch (error) {
+    console.error("Click tracking error:", error);
 
-  } catch (err) {
-    console.error("Click tracking error:", err);
-
-    /*
-    | Even if tracking fails, don't leave the user
-    | stuck on an error page.
-    */
-
+    // Keep the recipient from getting stuck on a tracking error.
     return res.redirect(302, WEBSITE_URL);
   }
 });
@@ -605,22 +373,26 @@ router.get("/track/click/:trackingId", async (req, res) => {
 |--------------------------------------------------------------------------
 | WEBSITE VISIT TRACKING
 |--------------------------------------------------------------------------
-|
-| Your website calls:
-|
-| GET /track/visit/:trackingId
-|
-|--------------------------------------------------------------------------
+| GET /api/profile/track/visit/:trackingId
+| Call this endpoint from your website when the tracking URL is opened.
 */
 
 router.get("/track/visit/:trackingId", async (req, res) => {
   try {
     const { trackingId } = req.params;
 
+    if (!trackingId) {
+      return res.status(400).json({
+        success: false,
+        message: "Tracking ID is required",
+      });
+    }
+
     const snapshot = await db
       .ref("profiles")
       .orderByChild("trackingId")
       .equalTo(trackingId)
+      .limitToFirst(1)
       .once("value");
 
     if (!snapshot.exists()) {
@@ -643,12 +415,6 @@ router.get("/track/visit/:trackingId", async (req, res) => {
       });
     }
 
-    /*
-    |--------------------------------------------------------------------------
-    | Record website visit
-    |--------------------------------------------------------------------------
-    */
-
     await db
       .ref(`profiles/${profileKey}/emailTracking`)
       .update({
@@ -656,48 +422,51 @@ router.get("/track/visit/:trackingId", async (req, res) => {
         visitedAt: Date.now(),
       });
 
-    /*
-    |--------------------------------------------------------------------------
-    | Return success
-    |--------------------------------------------------------------------------
-    */
-
     return res.json({
       success: true,
       message: "Visit tracked",
     });
-
-  } catch (err) {
-    console.error("Visit tracking error:", err);
+  } catch (error) {
+    console.error("Visit tracking error:", error);
 
     return res.status(500).json({
       success: false,
-      error: err.message,
+      message: "Unable to track visit",
     });
   }
 });
 
-// GET /api/profile/admin/users
-// Returns unique submitter emails for the dropdown.
+/*
+|--------------------------------------------------------------------------
+| ADMIN USERS
+|--------------------------------------------------------------------------
+| GET /api/profile/admin/users
+| Returns unique submitter emails for the dropdown.
+*/
+
 router.get("/admin/users", auth, async (req, res) => {
   try {
-    const snapshot = await db.ref("profiles").once("value");
-    const users = new Set();
+    const snapshot = await db
+      .ref("submitters")
+      .once("value");
+
+    const users = [];
 
     snapshot.forEach((item) => {
-      const submittedUser = item.val()?.submittedUser?.trim();
+      const email = item.val()?.email;
 
-      if (submittedUser) {
-        users.add(submittedUser.toLowerCase());
+      if (email) {
+        users.push(email);
       }
     });
 
     return res.json({
       success: true,
-      users: [...users].sort(),
+      users: [...new Set(users)].sort(),
     });
   } catch (error) {
     console.error("Fetch submitters error:", error);
+
     return res.status(500).json({
       success: false,
       message: "Unable to fetch submitters",
@@ -705,19 +474,95 @@ router.get("/admin/users", auth, async (req, res) => {
   }
 });
 
-// GET /api/profile/admin/all
-// Returns all submitted profiles and their tracking status.
+
+/*
+|--------------------------------------------------------------------------
+| ADMIN ALL PROFILES — PAGINATION
+|--------------------------------------------------------------------------
+| First page:
+| GET /api/profile/admin/all?limit=50
+|
+| Next page:
+| GET /api/profile/admin/all?limit=50&cursorCreatedAt=TIMESTAMP&cursorId=PROFILE_ID
+*/
+
 router.get("/admin/all", auth, async (req, res) => {
   try {
-    const snapshot = await db.ref("profiles").once("value");
-    const profiles = [];
+    const parsedLimit = Number.parseInt(req.query.limit, 10);
+    const limit = Math.min(
+      100,
+      Math.max(1, Number.isFinite(parsedLimit) ? parsedLimit : 50)
+    );
+
+    const cursorCreatedAt = req.query.cursorCreatedAt;
+    const cursorId = req.query.cursorId;
+
+    // Both cursor values must be supplied together.
+    if (
+      (cursorCreatedAt !== undefined) !==
+      (cursorId !== undefined)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Both cursorCreatedAt and cursorId are required",
+      });
+    }
+
+    let query = db
+      .ref("profiles")
+      .orderByChild("createdAt");
+
+    if (cursorCreatedAt !== undefined) {
+      const timestamp = Number(cursorCreatedAt);
+      const id = String(cursorId || "");
+
+      if (!Number.isFinite(timestamp) || !id) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid pagination cursor",
+        });
+      }
+
+      // Include the cursor item so we can remove it after reading.
+      query = query.endAt(timestamp, id);
+    }
+
+    // Fetch only a bounded set of records.
+    const snapshot = await query
+      .limitToLast(
+        cursorCreatedAt !== undefined
+          ? limit + 1
+          : limit + 1
+      )
+      .once("value");
+
+    let rows = [];
 
     snapshot.forEach((item) => {
-      const profile = item.val() || {};
+      rows.push({
+        id: item.key,
+        ...(item.val() || {}),
+      });
+    });
+
+    // Firebase's query order is oldest to newest.
+    rows.reverse();
+
+    // Remove the previous page's cursor record.
+    if (cursorId !== undefined) {
+      rows = rows.filter(
+        (profile) => profile.id !== String(cursorId)
+      );
+    }
+
+    const hasNextPage = rows.length > limit;
+    const pageRows = rows.slice(0, limit);
+
+    const profiles = pageRows.map((profile) => {
       const tracking = profile.emailTracking || {};
 
-      profiles.push({
-        id: item.key,
+      return {
+        id: profile.id,
         fullName: profile.fullName || "",
         email: profile.email || "",
         phone: profile.phone || "",
@@ -728,25 +573,230 @@ router.get("/admin/all", auth, async (req, res) => {
         clickedAt: tracking.clickedAt || null,
         visited: tracking.visited === true,
         visitedAt: tracking.visitedAt || null,
-      });
+        trackingId: profile.trackingId || "",
+      };
     });
 
-    profiles.sort(
-      (a, b) => (b.createdAt || 0) - (a.createdAt || 0)
-    );
+    // For newest-first pages, use the oldest returned item as
+    // the cursor for the next page.
+    const lastProfile = pageRows[pageRows.length - 1];
 
     return res.json({
       success: true,
-      total: profiles.length,
+      limit,
+      hasNextPage,
+      nextCursor:
+        hasNextPage && lastProfile
+          ? {
+              createdAt: lastProfile.createdAt,
+              id: lastProfile.id,
+            }
+          : null,
       profiles,
     });
   } catch (error) {
-    console.error("Fetch all profiles error:", error);
+    console.error("Fetch profiles error:", error);
+
     return res.status(500).json({
       success: false,
       message: "Unable to fetch profiles",
     });
   }
 });
+
+
+/*
+|--------------------------------------------------------------------------
+| ADMIN DASHBOARD STATS
+|--------------------------------------------------------------------------
+| GET /api/profile/admin/stats
+| POST /api/profile/admin/stats/refresh
+|
+| GET returns the most recently saved stats.
+| POST refreshes stats, subject to a 90-minute cooldown.
+*/
+
+const STATS_REFRESH_COOLDOWN = 90 * 60 * 1000;
+
+router.get("/admin/stats", auth, async (req, res) => {
+  res.set("Cache-Control", "no-store");
+res.set("Pragma", "no-cache");
+  try {
+    const snapshot = await db
+      .ref("adminSettings/profileDashboardStats")
+      .once("value");
+
+    const savedStats = snapshot.val();
+
+    if (!savedStats) {
+      return res.json({
+        success: true,
+        stats: null,
+        lastRefreshedAt: null,
+        refreshAvailable: true,
+        message: "Refresh stats to load the latest counts",
+      });
+    }
+
+    const lastRefreshedAt = Number(savedStats.lastRefreshedAt) || null;
+    const remainingMs = lastRefreshedAt
+      ? Math.max(
+          0,
+          STATS_REFRESH_COOLDOWN - (Date.now() - lastRefreshedAt)
+        )
+      : 0;
+
+    return res.json({
+      success: true,
+      stats: savedStats.stats || null,
+      lastRefreshedAt,
+      refreshAvailable: remainingMs === 0,
+      remainingMs,
+    });
+  } catch (error) {
+    console.error("Dashboard stats read error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Unable to fetch dashboard stats",
+    });
+  }
+});
+
+
+router.post("/admin/stats/refresh", auth, async (req, res) => {
+  res.set("Cache-Control", "no-store");
+  res.set("Pragma", "no-cache");
+
+  const statsRef = db.ref("adminSettings/profileDashboardStats");
+  const lockRef = db.ref("adminSettings/profileDashboardStatsRefreshLock");
+  const now = Date.now();
+  const lockId = crypto.randomUUID();
+
+  try {
+    // Claim the lock atomically. The lock has a 10-minute expiry.
+    const lockTransaction = await lockRef.transaction((current) => {
+      const lockTime = Number(current?.lockedAt) || 0;
+      const lockIsActive =
+        current?.lockId &&
+        now - lockTime < 10 * 60 * 1000;
+
+      if (lockIsActive) return;
+
+      return {
+        lockId,
+        lockedAt: now,
+      };
+    });
+
+    if (!lockTransaction.committed) {
+      return res.status(409).json({
+        success: false,
+        message: "A statistics refresh is already in progress. Try again shortly.",
+      });
+    }
+
+    // Enforce the 90-minute cooldown using saved statistics.
+    const savedSnapshot = await statsRef.once("value");
+    const saved = savedSnapshot.val() || {};
+    const lastRefreshedAt = Number(saved.lastRefreshedAt) || 0;
+    const elapsed = Date.now() - lastRefreshedAt;
+
+    if (lastRefreshedAt && elapsed < STATS_REFRESH_COOLDOWN) {
+      // Release only the lock owned by this request.
+      await lockRef.transaction((current) => {
+        if (current?.lockId !== lockId) return;
+        return null;
+      });
+
+      return res.status(429).json({
+        success: false,
+        message: "Stats can only be refreshed every 90 minutes.",
+        lastRefreshedAt,
+        remainingMs: Math.max(0, STATS_REFRESH_COOLDOWN - elapsed),
+      });
+    }
+
+    // Count all profiles.
+    const profilesSnapshot = await db.ref("profiles").once("value");
+
+    let totalUsers = 0;
+    let clickedUsers = 0;
+
+    profilesSnapshot.forEach((child) => {
+      const profile = child.val();
+      if (!profile) return;
+
+      totalUsers += 1;
+
+      if (
+        profile.emailTracking?.clicked === true ||
+        profile.clicked === true
+      ) {
+        clickedUsers += 1;
+      }
+    });
+
+    const completedAt = Date.now();
+
+    const stats = {
+      totalUsers,
+      clickedUsers,
+      notClickedUsers: totalUsers - clickedUsers,
+      clickRate: totalUsers
+        ? Number(((clickedUsers / totalUsers) * 100).toFixed(2))
+        : 0,
+    };
+
+    // Verify lock ownership before saving.
+    const currentLock = (await lockRef.once("value")).val();
+
+    if (currentLock?.lockId !== lockId) {
+      return res.status(409).json({
+        success: false,
+        message: "Refresh lock expired or was replaced. Please try again.",
+      });
+    }
+
+    // Save the aggregate stats without storing lock fields in this node.
+    await statsRef.update({
+      stats,
+      lastRefreshedAt: completedAt,
+    });
+
+    // Release our lock only.
+    await lockRef.transaction((current) => {
+      if (current?.lockId !== lockId) return;
+      return null;
+    });
+
+    return res.json({
+      success: true,
+      stats,
+      lastRefreshedAt: completedAt,
+      refreshAvailable: false,
+      remainingMs: STATS_REFRESH_COOLDOWN,
+    });
+  } catch (error) {
+    console.error("Dashboard stats refresh error:", error);
+
+    // Never release a lock belonging to a different request.
+    try {
+      await lockRef.transaction((current) => {
+        if (current?.lockId !== lockId) return;
+        return null;
+      });
+    } catch (cleanupError) {
+      console.error("Stats refresh lock cleanup error:", cleanupError);
+    }
+
+    return res.status(500).json({
+      success: false,
+      message: "Unable to refresh dashboard stats.",
+    });
+  }
+});
+
+
 
 export default router;
