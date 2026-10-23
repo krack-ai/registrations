@@ -33,7 +33,8 @@ try {
 
 const app = initializeApp({
   credential: cert(serviceAccount),
-  databaseURL: "https://registrations-aa57b-default-rtdb.firebaseio.com",
+  // databaseURL: "https://registrations-aa57b-default-rtdb.firebaseio.com",
+    databaseURL: "https://registrations-v2-default-rtdb.firebaseio.com"
 });
 
 const db = getDatabase(app);
